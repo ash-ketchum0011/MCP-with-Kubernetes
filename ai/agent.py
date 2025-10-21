@@ -68,13 +68,26 @@ class AIAgent:
                 print(f"[DEBUG] Sending to AI: {user_msg[:200]}...")
             
             # Get AI response
-            reply = self.adapter.chat(self._get_system_prompt(), user_msg)
+            try:
+                reply = self.adapter.chat(self._get_system_prompt(), user_msg)
+            except Exception as e:
+                return {"error": f"AI adapter error: {str(e)}", "details": f"Step {step + 1}"}
+            
+            # Check if reply is None or empty
+            if reply is None:
+                return {"error": "AI returned None response", "details": "The LLM adapter returned None. Check API key, credits, or model availability."}
+            
+            if not isinstance(reply, str):
+                return {"error": f"AI returned non-string response: {type(reply)}", "details": str(reply)}
             
             if DEBUG:
                 print(f"[DEBUG] AI raw response: {reply}")
             
             # Clean up response - remove markdown code blocks if present
             reply = reply.strip()
+            if not reply:
+                return {"error": "AI returned empty response", "details": "The model returned an empty string."}
+            
             if reply.startswith("```json"):
                 reply = reply[7:]
             if reply.startswith("```"):
@@ -89,7 +102,7 @@ class AIAgent:
             try:
                 parsed = json.loads(reply)
             except json.JSONDecodeError as e:
-                return f"❌ Error: AI returned invalid JSON:\n{reply}\n\nError: {e}"
+                return {"error": f"AI returned invalid JSON: {str(e)}", "details": f"Response: {reply[:500]}"}
             
             # Check if this is a tool call
             if "tool_call" in parsed:
@@ -101,7 +114,7 @@ class AIAgent:
                     print(f"[DEBUG] Tool call: {tool_name} with args {tool_args}")
                 
                 if tool_name not in self.tools:
-                    return f"❌ Error: AI requested unknown tool '{tool_name}'. Available: {list(self.tools.keys())}"
+                    return {"error": f"AI requested unknown tool '{tool_name}'", "details": f"Available: {list(self.tools.keys())}"}
                 
                 # Invoke the tool
                 try:
@@ -122,7 +135,7 @@ class AIAgent:
                     })
                     
                 except Exception as e:
-                    return f"❌ Error invoking tool '{tool_name}': {e}"
+                    return {"error": f"Error invoking tool '{tool_name}'", "details": str(e)}
             
             # Check if this is a final response
             elif "final_response" in parsed:
@@ -152,6 +165,6 @@ class AIAgent:
                 return "\n".join(output)
             
             else:
-                return f"❌ Error: AI returned unexpected format:\n{json.dumps(parsed, indent=2)}"
+                return {"error": "AI returned unexpected format", "details": json.dumps(parsed, indent=2)}
         
-        return f"❌ Error: Reached maximum conversation steps ({max_steps}) without a final response. The AI may be stuck in a loop."
+        return {"error": f"Reached maximum conversation steps ({max_steps})", "details": "The AI may be stuck in a loop."}

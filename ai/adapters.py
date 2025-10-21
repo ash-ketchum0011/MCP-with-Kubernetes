@@ -16,17 +16,29 @@ class OpenAIAdapter:
         self.model = "gpt-4o-mini"
     
     def chat(self, system: str, user: str, max_tokens: int = 1024, temperature: float = 0.0):
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ]
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature
-        )
-        return response.choices[0].message.content
+        try:
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ]
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature
+            )
+            
+            # Check if we got a valid response
+            if not response.choices or len(response.choices) == 0:
+                raise RuntimeError("OpenAI returned empty choices")
+            
+            content = response.choices[0].message.content
+            if content is None:
+                raise RuntimeError("OpenAI returned None content")
+            
+            return content
+        except Exception as e:
+            raise RuntimeError(f"OpenAI API error: {str(e)}") from e
 
 
 class OpenRouterAdapter:
@@ -44,12 +56,12 @@ class OpenRouterAdapter:
         print(f"🌐 Using OpenRouter with model: {model}")
     
     def chat(self, system: str, user: str, max_tokens: int = 1024, temperature: float = 0.0):
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ]
-        
         try:
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ]
+            
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
@@ -60,9 +72,25 @@ class OpenRouterAdapter:
                     "X-Title": "K8s AI Assistant"  # Optional: show in rankings
                 }
             )
-            return response.choices[0].message.content
+            
+            # Validate response structure
+            if not response.choices or len(response.choices) == 0:
+                raise RuntimeError("OpenRouter returned empty choices array")
+            
+            if not hasattr(response.choices[0], 'message'):
+                raise RuntimeError("OpenRouter response missing message")
+            
+            content = response.choices[0].message.content
+            
+            # Check for None content
+            if content is None:
+                raise RuntimeError("OpenRouter returned None content. This may indicate rate limiting, insufficient credits, or model unavailability.")
+            
+            return content
+            
         except Exception as e:
-            return f'{{"error": "OpenRouter API error: {str(e)}"}}'
+            # Re-raise the exception so the agent can handle it properly
+            raise RuntimeError(f"OpenRouter API error: {str(e)}") from e
 
 
 class LocalAdapter:
