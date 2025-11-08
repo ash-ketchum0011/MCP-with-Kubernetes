@@ -9,7 +9,7 @@ import os
 console = Console()
 
 def terminal_chat():
-    console.print(Panel.fit("🤖 Kubernetes AI Assistant\nType 'exit' to quit", style="bold blue"))
+    console.print(Panel.fit("🤖 KubeSensei - Kubernetes AI Assistant\nType 'exit' to quit", style="bold blue"))
 
     # Choose adapter based on env var
     provider = os.getenv("LLM_PROVIDER", "local").lower()
