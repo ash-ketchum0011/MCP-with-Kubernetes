@@ -1,4 +1,4 @@
-# cli/chat.py - Complete working version
+# cli/chat.py
 import sys
 from pathlib import Path
 
@@ -9,6 +9,7 @@ sys.path.insert(0, str(project_root))
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.syntax import Syntax
 from ai.agent import AIAgent
 from ai.adapters import OpenAIAdapter, OpenRouterAdapter, LocalAdapter
 from dotenv import load_dotenv
@@ -18,7 +19,12 @@ console = Console()
 load_dotenv()
 
 def terminal_chat():
-    console.print(Panel.fit("🤖 KubeSensei - Kubernetes AI Assistant\nType 'exit' to quit", style="bold blue"))
+    console.print(Panel.fit(
+        "🤖 KubeSensei - Kubernetes AI Assistant\n"
+        "💡 Ask for troubleshooting OR YAML generation\n"
+        "Type 'exit' to quit",
+        style="bold blue"
+    ))
 
     # Choose adapter based on env var
     provider = os.getenv("LLM_PROVIDER", "local").lower()
@@ -38,17 +44,29 @@ def terminal_chat():
     
     agent = AIAgent(adapter)
 
+    # Show examples
+    console.print("\n[dim]Example queries:[/dim]")
+    console.print("[dim]  • Why is my nginx pod crashing?[/dim]")
+    console.print("[dim]  • Generate YAML for ServiceAccount 'my-sa' in namespace 'default'[/dim]")
+    console.print("[dim]  • Create deployment YAML for nginx with 3 replicas[/dim]")
+    console.print("[dim]  • Show me YAML for ClusterRole with pod read permissions[/dim]\n")
+
     while True:
-        user_input = console.input("\n[bold green]You:[/] ")
-        if user_input.lower() in ["exit", "quit"]:
+        user_input = console.input("[bold green]You:[/] ").strip()
+        
+        if user_input.lower() in ["exit", "quit", "q"]:
             console.print("👋 Goodbye!")
             break
+        
+        if not user_input:
+            continue
 
-        with console.status("[bold yellow]AI is analyzing your cluster..."):
+        with console.status("[bold yellow]AI is thinking..."):
             response = agent.process_input(user_input)
 
         console.print("\n[bold blue]AI:[/]")
         console.print(Markdown(response))
+        console.print()  # Extra line for spacing
 
 
 if __name__ == "__main__":

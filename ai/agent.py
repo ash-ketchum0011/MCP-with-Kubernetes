@@ -4,8 +4,12 @@ import asyncio
 import os
 from typing import Dict, Any
 from mcp.server import LocalMCP, list_tools
+from dotenv import load_dotenv
 
-SYSTEM_PROMPT = """You are a Kubernetes SRE assistant that helps diagnose cluster issues.
+load_dotenv()
+
+# Enhanced system prompt with YAML generation capability
+SYSTEM_PROMPT = """You are a Kubernetes SRE assistant that helps diagnose cluster issues and generate Kubernetes manifests.
 
 CRITICAL: You MUST respond with ONLY valid JSON. No markdown, no explanations, ONLY JSON.
 
@@ -15,23 +19,85 @@ Two response formats:
 {{"tool_call": {{"name": "TOOL_NAME", "args": {{}}}}}}
 
 2) To give final answer:
-{{"final_response": {{"analysis": "your analysis here", "recommendation": "your recommendation", "kubectl": "kubectl command", "confidence": 0.9, "post_checks": ["check 1", "check 2"]}}}}
+{{"final_response": {{"analysis": "...", "recommendation": "...", "kubectl": "...", "yaml": "...", "confidence": 0.9, "post_checks": [...]}}}}
 
 Available tools: {tools}
 
-RULES:
-- First call get_pods or relevant tool to gather data
-- Analyze the tool results
-- Then respond with final_response
-- ONLY use tools from the list above
-- Tools are read-only, never mutate cluster
-- Keep responses concise
+ENHANCED TROUBLESHOOTING METHODOLOGY:
 
-Example conversation:
-User: "list pods"
-You: {{"tool_call": {{"name": "get_pods", "args": {{"namespace": "default"}}}}}}
-[Tool returns pod data]
-You: {{"final_response": {{"analysis": "Found 5 pods, 3 running, 2 pending", "recommendation": "Check pending pods for scheduling issues", "kubectl": "kubectl describe pod <pod-name>", "confidence": 0.95, "post_checks": ["Check node resources", "Review pod events"]}}}}
+**Step 1: Get Overview**
+- Use get_cluster_health_summary() first for high-level cluster status
+
+**Step 2: Diagnose by Problem Type**
+
+A) POD ISSUES (crash, restart, OOM):
+   1. get_pods() → identify failing pods
+   2. get_pod_logs() → find error messages
+   3. get_pod_metrics() → check resource usage
+   4. get_cluster_events() → check OOMKilled, ImagePull failures
+   5. check_pod_config_references() → verify configs exist
+
+B) NETWORKING ISSUES (connection refused, timeout, DNS):
+   1. get_services() → verify service exists
+   2. get_endpoints() → CHECK IF SERVICE HAS BACKING PODS (critical!)
+   3. get_network_policies() → check for traffic blocking rules
+   4. get_ingresses() → check external access configuration
+
+C) STORAGE ISSUES (pending PVC, volume mount failures):
+   1. get_persistent_volume_claims() → check PVC status
+   2. get_persistent_volumes() → check PV availability
+
+D) CONFIGURATION ISSUES (ConfigMap/Secret not found):
+   1. get_configmaps() → verify ConfigMap exists
+   2. get_secrets() → verify Secret exists (shows keys only)
+   3. check_pod_config_references() → find which configs are missing
+
+E) SCHEDULING/RESOURCE ISSUES (pod pending, nodes full):
+   1. get_node_details() → check node capacity and conditions
+   2. get_resource_quotas() → check if quotas are maxed out
+
+F) PERMISSION ISSUES (Forbidden, Unauthorized):
+   1. check_service_account_permissions() → verify RBAC setup
+   2. get_cluster_events() → look for permission denied events
+
+**Common Patterns:**
+- Service 503/502 → get_endpoints → NO endpoints → check backing pods
+- Connection timeout → get_network_policies → policy blocking traffic
+- Pod pending → get_node_details → nodes at capacity OR get_persistent_volume_claims → PVC pending
+- ConfigMap error → check_pod_config_references → ConfigMap missing
+- Forbidden errors → check_service_account_permissions → no RBAC bindings
+
+**YAML GENERATION CAPABILITY:**
+When user asks for YAML/manifest/configuration:
+- Generate complete, valid Kubernetes YAML
+- Include all required fields (apiVersion, kind, metadata, spec)
+- Use best practices (labels, resource limits, probes)
+- Add helpful comments
+- Return in the "yaml" field of final_response
+- Set kubectl command to "kubectl apply -f <filename>"
+
+YAML EXAMPLES:
+User: "create yaml for service account my-sa in namespace default"
+You: {{"final_response": {{
+  "analysis": "Generated ServiceAccount YAML for 'my-sa' in 'default' namespace with standard labels",
+  "recommendation": "Review and apply. Add RoleBindings as needed for permissions.",
+  "kubectl": "kubectl apply -f serviceaccount.yaml",
+  "yaml": "apiVersion: v1\\nkind: ServiceAccount\\nmetadata:\\n  name: my-sa\\n  namespace: default\\n  labels:\\n    app: my-sa",
+  "confidence": 1.0,
+  "post_checks": ["kubectl get sa my-sa -n default"]
+}}}}
+
+**Tool Selection Rules:**
+- Always check service endpoints before assuming network issue
+- Always check PVC status if pod is pending with volume
+- Use get_cluster_health_summary for "what's wrong?" questions
+- For YAML generation, skip tools and generate directly
+
+**kubectl Command Guidelines:**
+- Include namespace: -n <namespace>
+- Prefer diagnostic commands: describe, logs, get, top
+- Avoid destructive: delete, apply (except for generated YAML)
+- Format for copy-paste: single line, executable
 
 Remember: ONLY output JSON, nothing else."""
 
@@ -68,26 +134,13 @@ class AIAgent:
                 print(f"[DEBUG] Sending to AI: {user_msg[:200]}...")
             
             # Get AI response
-            try:
-                reply = self.adapter.chat(self._get_system_prompt(), user_msg)
-            except Exception as e:
-                return {"error": f"AI adapter error: {str(e)}", "details": f"Step {step + 1}"}
-            
-            # Check if reply is None or empty
-            if reply is None:
-                return {"error": "AI returned None response", "details": "The LLM adapter returned None. Check API key, credits, or model availability."}
-            
-            if not isinstance(reply, str):
-                return {"error": f"AI returned non-string response: {type(reply)}", "details": str(reply)}
+            reply = self.adapter.chat(self._get_system_prompt(), user_msg)
             
             if DEBUG:
                 print(f"[DEBUG] AI raw response: {reply}")
             
             # Clean up response - remove markdown code blocks if present
             reply = reply.strip()
-            if not reply:
-                return {"error": "AI returned empty response", "details": "The model returned an empty string."}
-            
             if reply.startswith("```json"):
                 reply = reply[7:]
             if reply.startswith("```"):
@@ -102,7 +155,7 @@ class AIAgent:
             try:
                 parsed = json.loads(reply)
             except json.JSONDecodeError as e:
-                return {"error": f"AI returned invalid JSON: {str(e)}", "details": f"Response: {reply[:500]}"}
+                return f"❌ Error: AI returned invalid JSON:\n{reply}\n\nError: {e}"
             
             # Check if this is a tool call
             if "tool_call" in parsed:
@@ -114,7 +167,7 @@ class AIAgent:
                     print(f"[DEBUG] Tool call: {tool_name} with args {tool_args}")
                 
                 if tool_name not in self.tools:
-                    return {"error": f"AI requested unknown tool '{tool_name}'", "details": f"Available: {list(self.tools.keys())}"}
+                    return f"❌ Error: AI requested unknown tool '{tool_name}'. Available: {list(self.tools.keys())}"
                 
                 # Invoke the tool
                 try:
@@ -135,7 +188,7 @@ class AIAgent:
                     })
                     
                 except Exception as e:
-                    return {"error": f"Error invoking tool '{tool_name}'", "details": str(e)}
+                    return f"❌ Error invoking tool '{tool_name}': {e}"
             
             # Check if this is a final response
             elif "final_response" in parsed:
@@ -151,6 +204,14 @@ class AIAgent:
                 output.append("\n## 💡 Recommendation")
                 output.append(resp.get("recommendation", "N/A"))
                 
+                # Handle YAML output if present
+                if resp.get("yaml"):
+                    output.append("\n## 📄 Generated YAML")
+                    yaml_content = resp.get("yaml", "")
+                    # Unescape newlines
+                    yaml_content = yaml_content.replace("\\n", "\n")
+                    output.append(f"```yaml\n{yaml_content}\n```")
+                
                 if resp.get("kubectl"):
                     output.append("\n## 🔧 Suggested Command")
                     output.append(f"```bash\n{resp.get('kubectl')}\n```")
@@ -165,6 +226,6 @@ class AIAgent:
                 return "\n".join(output)
             
             else:
-                return {"error": "AI returned unexpected format", "details": json.dumps(parsed, indent=2)}
+                return f"❌ Error: AI returned unexpected format:\n{json.dumps(parsed, indent=2)}"
         
-        return {"error": f"Reached maximum conversation steps ({max_steps})", "details": "The AI may be stuck in a loop."}
+        return f"❌ Error: Reached maximum conversation steps ({max_steps}) without a final response. The AI may be stuck in a loop."
