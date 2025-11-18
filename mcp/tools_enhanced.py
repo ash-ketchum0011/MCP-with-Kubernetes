@@ -3,8 +3,9 @@
 
 from mcp.server import tool
 from kubernetes import client, config
-import base64
 import subprocess
+import shlex
+import yaml
 import json
 
 # Initialize clients
@@ -16,7 +17,249 @@ rbac_v1 = client.RbacAuthorizationV1Api()
 
 
 # ==========================================
-# NETWORKING TOOLS
+# YAML RETRIEVAL TOOLS (NEW)
+# ==========================================
+
+@tool()
+async def get_deployment_yaml(deployment_name: str, namespace: str = "default"):
+    """
+    Get the actual YAML manifest of an existing deployment.
+    This returns the real configuration, not a generated one.
+    
+    Args:
+        deployment_name: Name of the deployment
+        namespace: Namespace (default: "default")
+    """
+    try:
+        deployment = apps_v1.read_namespaced_deployment(deployment_name, namespace)
+        
+        # Convert to dict and clean up managed fields
+        deployment_dict = client.ApiClient().sanitize_for_serialization(deployment)
+        
+        # Remove unnecessary metadata
+        if 'metadata' in deployment_dict:
+            deployment_dict['metadata'].pop('managedFields', None)
+            deployment_dict['metadata'].pop('uid', None)
+            deployment_dict['metadata'].pop('resourceVersion', None)
+            deployment_dict['metadata'].pop('generation', None)
+            deployment_dict['metadata'].pop('creationTimestamp', None)
+            deployment_dict['metadata'].pop('selfLink', None)
+        
+        # Remove status section
+        deployment_dict.pop('status', None)
+        
+        # Convert to YAML
+        yaml_content = yaml.dump(deployment_dict, default_flow_style=False, sort_keys=False)
+        
+        return {
+            "deployment": deployment_name,
+            "namespace": namespace,
+            "yaml": yaml_content,
+            "replicas": deployment.spec.replicas,
+            "image": deployment.spec.template.spec.containers[0].image if deployment.spec.template.spec.containers else "N/A"
+        }
+    except client.exceptions.ApiException as e:
+        if e.status == 404:
+            return {"error": f"Deployment '{deployment_name}' not found in namespace '{namespace}'"}
+        return {"error": f"API error: {e.reason}"}
+    except Exception as e:
+        return {"error": f"Failed to get deployment YAML: {e}"}
+
+
+@tool()
+async def get_pod_yaml(pod_name: str, namespace: str = "default"):
+    """
+    Get the actual YAML manifest of an existing pod.
+    
+    Args:
+        pod_name: Name of the pod
+        namespace: Namespace (default: "default")
+    """
+    try:
+        pod = v1.read_namespaced_pod(pod_name, namespace)
+        
+        # Convert to dict and clean up
+        pod_dict = client.ApiClient().sanitize_for_serialization(pod)
+        
+        # Remove unnecessary metadata
+        if 'metadata' in pod_dict:
+            pod_dict['metadata'].pop('managedFields', None)
+            pod_dict['metadata'].pop('uid', None)
+            pod_dict['metadata'].pop('resourceVersion', None)
+            pod_dict['metadata'].pop('creationTimestamp', None)
+            pod_dict['metadata'].pop('selfLink', None)
+        
+        # Remove status
+        pod_dict.pop('status', None)
+        
+        yaml_content = yaml.dump(pod_dict, default_flow_style=False, sort_keys=False)
+        
+        return {
+            "pod": pod_name,
+            "namespace": namespace,
+            "yaml": yaml_content
+        }
+    except client.exceptions.ApiException as e:
+        if e.status == 404:
+            return {"error": f"Pod '{pod_name}' not found in namespace '{namespace}'"}
+        return {"error": f"API error: {e.reason}"}
+    except Exception as e:
+        return {"error": f"Failed to get pod YAML: {e}"}
+
+
+@tool()
+async def get_service_yaml(service_name: str, namespace: str = "default"):
+    """
+    Get the actual YAML manifest of an existing service.
+    
+    Args:
+        service_name: Name of the service
+        namespace: Namespace (default: "default")
+    """
+    try:
+        service = v1.read_namespaced_service(service_name, namespace)
+        
+        service_dict = client.ApiClient().sanitize_for_serialization(service)
+        
+        if 'metadata' in service_dict:
+            service_dict['metadata'].pop('managedFields', None)
+            service_dict['metadata'].pop('uid', None)
+            service_dict['metadata'].pop('resourceVersion', None)
+            service_dict['metadata'].pop('creationTimestamp', None)
+            service_dict['metadata'].pop('selfLink', None)
+        
+        service_dict.pop('status', None)
+        
+        # Remove clusterIP and clusterIPs as they're auto-assigned
+        if 'spec' in service_dict:
+            service_dict['spec'].pop('clusterIP', None)
+            service_dict['spec'].pop('clusterIPs', None)
+            service_dict['spec'].pop('internalTrafficPolicy', None)
+            service_dict['spec'].pop('ipFamilies', None)
+            service_dict['spec'].pop('ipFamilyPolicy', None)
+            service_dict['spec'].pop('sessionAffinity', None)
+        
+        yaml_content = yaml.dump(service_dict, default_flow_style=False, sort_keys=False)
+        
+        return {
+            "service": service_name,
+            "namespace": namespace,
+            "yaml": yaml_content
+        }
+    except client.exceptions.ApiException as e:
+        if e.status == 404:
+            return {"error": f"Service '{service_name}' not found in namespace '{namespace}'"}
+        return {"error": f"API error: {e.reason}"}
+    except Exception as e:
+        return {"error": f"Failed to get service YAML: {e}"}
+
+
+# ==========================================
+# DEPLOYMENT EDITING TOOLS (NEW)
+# ==========================================
+
+@tool()
+async def patch_deployment_command(
+    deployment_name: str,
+    container_name: str,
+    new_command: list,
+    namespace: str = "default"
+):
+    """
+    Update the command of a container in a deployment.
+    This directly patches the deployment spec.
+    
+    Args:
+        deployment_name: Name of the deployment
+        container_name: Name of the container to update
+        new_command: New command as a list (e.g., ["sh", "-c", "sleep 3600"])
+        namespace: Namespace (default: "default")
+    
+    Example:
+        new_command = ["sh", "-c", "echo 'Hello' && sleep 3600"]
+    """
+    try:
+        # Read current deployment
+        deployment = apps_v1.read_namespaced_deployment(deployment_name, namespace)
+        
+        # Find the container and update its command
+        container_found = False
+        for container in deployment.spec.template.spec.containers:
+            if container.name == container_name:
+                container.command = new_command
+                container_found = True
+                break
+        
+        if not container_found:
+            return {
+                "error": f"Container '{container_name}' not found in deployment '{deployment_name}'",
+                "available_containers": [c.name for c in deployment.spec.template.spec.containers]
+            }
+        
+        # Patch the deployment
+        apps_v1.patch_namespaced_deployment(
+            name=deployment_name,
+            namespace=namespace,
+            body=deployment
+        )
+        
+        return {
+            "success": True,
+            "deployment": deployment_name,
+            "container": container_name,
+            "new_command": new_command,
+            "message": f"Successfully updated command for container '{container_name}' in deployment '{deployment_name}'",
+            "note": "Pods will be automatically recreated with the new command"
+        }
+    except client.exceptions.ApiException as e:
+        if e.status == 404:
+            return {"error": f"Deployment '{deployment_name}' not found in namespace '{namespace}'"}
+        return {"error": f"API error: {e.reason}"}
+    except Exception as e:
+        return {"error": f"Failed to patch deployment: {e}"}
+
+
+@tool()
+async def patch_deployment_replicas(
+    deployment_name: str,
+    replicas: int,
+    namespace: str = "default"
+):
+    """
+    Scale a deployment by updating its replica count.
+    
+    Args:
+        deployment_name: Name of the deployment
+        replicas: New replica count
+        namespace: Namespace (default: "default")
+    """
+    try:
+        # Use scale subresource for efficiency
+        scale = apps_v1.read_namespaced_deployment_scale(deployment_name, namespace)
+        scale.spec.replicas = replicas
+        
+        apps_v1.patch_namespaced_deployment_scale(
+            name=deployment_name,
+            namespace=namespace,
+            body=scale
+        )
+        
+        return {
+            "success": True,
+            "deployment": deployment_name,
+            "new_replicas": replicas,
+            "message": f"Scaled deployment '{deployment_name}' to {replicas} replicas"
+        }
+    except client.exceptions.ApiException as e:
+        if e.status == 404:
+            return {"error": f"Deployment '{deployment_name}' not found in namespace '{namespace}'"}
+        return {"error": f"API error: {e.reason}"}
+    except Exception as e:
+        return {"error": f"Failed to scale deployment: {e}"}
+
+
+# ==========================================
+# NETWORKING TOOLS (EXISTING - KEPT AS IS)
 # ==========================================
 
 @tool()
@@ -145,18 +388,33 @@ async def get_network_policies(namespace: str = "default"):
 
 
 @tool()
-async def test_dns_from_pod(pod_name: str, namespace: str = "default", dns_name: str = "kubernetes.default.svc.cluster.local"):
+async def test_dns_from_pod(pod_name: str = None, namespace: str = "default", dns_name: str = "kubernetes.default.svc.cluster.local", pod: str = None):
     """
     Test DNS resolution from inside a pod.
     Uses kubectl exec to run nslookup/dig.
     
     CRITICAL for debugging "service not found" errors.
+    
+    Args:
+        pod_name: Name of the pod to test from (alias: pod)
+        namespace: The namespace of the pod (default: "default")
+        dns_name: DNS name to resolve (default: "kubernetes.default.svc.cluster.local")
     """
+    # Handle both parameter names
+    actual_pod_name = pod_name or pod
+    if not actual_pod_name:
+        return {"error": "pod_name or pod parameter is required"}
+    
     try:
+        # Sanitize inputs to prevent command injection
+        safe_namespace = shlex.quote(namespace)
+        safe_pod_name = shlex.quote(actual_pod_name)
+        safe_dns_name = shlex.quote(dns_name)
+        
         # Try to exec into pod and test DNS
         exec_command = [
-            'kubectl', 'exec', '-n', namespace, pod_name, '--',
-            'nslookup', dns_name
+            'kubectl', 'exec', '-n', safe_namespace, safe_pod_name, '--',
+            'nslookup', safe_dns_name
         ]
         
         result = subprocess.run(
@@ -167,7 +425,7 @@ async def test_dns_from_pod(pod_name: str, namespace: str = "default", dns_name:
         )
         
         return {
-            "pod": pod_name,
+            "pod": actual_pod_name,
             "dns_query": dns_name,
             "success": result.returncode == 0,
             "output": result.stdout,
@@ -181,36 +439,58 @@ async def test_dns_from_pod(pod_name: str, namespace: str = "default", dns_name:
 
 @tool()
 async def test_connectivity_from_pod(
-    source_pod: str,
-    source_namespace: str,
-    target: str,
+    source_pod: str = None,
+    source_namespace: str = "default",
+    target: str = None,
     port: int = 80,
-    timeout: int = 5
+    timeout: int = 5,
+    pod: str = None
 ):
     """
     Test network connectivity from one pod to another service/pod.
     Uses kubectl exec to run curl/nc (netcat).
     
     Example: test if nginx pod can reach database:5432
+    
+    Args:
+        source_pod: Name of the source pod to test from (alias: pod)
+        source_namespace: Namespace of source pod
+        target: Target hostname/IP to test
+        port: Port to test (default: 80)
+        timeout: Timeout in seconds (default: 5)
     """
+    # Handle both parameter names
+    actual_pod_name = source_pod or pod
+    if not actual_pod_name:
+        return {"error": "source_pod or pod parameter is required"}
+    if not target:
+        return {"error": "target parameter is required"}
+    
     try:
+        # Sanitize inputs to prevent command injection
+        safe_namespace = shlex.quote(source_namespace)
+        safe_pod = shlex.quote(actual_pod_name)
+        safe_target = shlex.quote(target)
+        safe_port = str(int(port))  # Validate port is integer
+        safe_timeout = str(int(timeout))  # Validate timeout is integer
+        
         # Try netcat first (most reliable for port testing)
         exec_command = [
-            'kubectl', 'exec', '-n', source_namespace, source_pod, '--',
-            'nc', '-zv', '-w', str(timeout), target, str(port)
+            'kubectl', 'exec', '-n', safe_namespace, safe_pod, '--',
+            'nc', '-zv', '-w', safe_timeout, safe_target, safe_port
         ]
         
         result = subprocess.run(
             exec_command,
             capture_output=True,
             text=True,
-            timeout=timeout + 2
+            timeout=int(timeout) + 2
         )
         
         success = result.returncode == 0 or "succeeded" in result.stderr.lower()
         
         return {
-            "source_pod": source_pod,
+            "source_pod": actual_pod_name,
             "target": f"{target}:{port}",
             "connection": "SUCCESS" if success else "FAILED",
             "output": result.stdout + result.stderr,
@@ -218,7 +498,7 @@ async def test_connectivity_from_pod(
         }
     except subprocess.TimeoutExpired:
         return {
-            "source_pod": source_pod,
+            "source_pod": actual_pod_name,
             "target": f"{target}:{port}",
             "connection": "TIMEOUT",
             "diagnosis": "Connection timed out - target may be down or network is very slow"
@@ -228,7 +508,7 @@ async def test_connectivity_from_pod(
 
 
 # ==========================================
-# STORAGE TOOLS
+# STORAGE TOOLS (EXISTING - KEPT AS IS)
 # ==========================================
 
 @tool()
@@ -280,7 +560,7 @@ async def get_persistent_volume_claims(namespace: str = "default"):
 
 
 # ==========================================
-# CONFIGURATION TOOLS
+# CONFIGURATION TOOLS (EXISTING - KEPT AS IS)
 # ==========================================
 
 @tool()
@@ -329,19 +609,28 @@ async def get_secrets(namespace: str = "default"):
 
 
 @tool()
-async def check_pod_config_references(pod_name: str, namespace: str = "default"):
+async def check_pod_config_references(pod_name: str = None, namespace: str = "default", pod: str = None):
     """
     Check if a pod's ConfigMaps and Secrets actually exist.
     Critical for debugging "ConfigMap not found" errors.
+    
+    Args:
+        pod_name: Name of the pod to check (alias: pod)
+        namespace: The namespace of the pod (default: "default")
     """
+    # Handle both parameter names
+    actual_pod_name = pod_name or pod
+    if not actual_pod_name:
+        return {"error": "pod_name or pod parameter is required"}
+    
     try:
-        pod = v1.read_namespaced_pod(pod_name, namespace)
+        pod_obj = v1.read_namespaced_pod(actual_pod_name, namespace)
         
         missing_configs = []
         missing_secrets = []
         
         # Check ConfigMap references
-        for volume in (pod.spec.volumes or []):
+        for volume in (pod_obj.spec.volumes or []):
             if volume.config_map:
                 cm_name = volume.config_map.name
                 try:
@@ -350,7 +639,7 @@ async def check_pod_config_references(pod_name: str, namespace: str = "default")
                     missing_configs.append(cm_name)
         
         # Check Secret references
-        for volume in (pod.spec.volumes or []):
+        for volume in (pod_obj.spec.volumes or []):
             if volume.secret:
                 secret_name = volume.secret.secret_name
                 try:
@@ -359,7 +648,7 @@ async def check_pod_config_references(pod_name: str, namespace: str = "default")
                     missing_secrets.append(secret_name)
         
         # Check envFrom
-        for container in pod.spec.containers:
+        for container in pod_obj.spec.containers:
             if container.env_from:
                 for env_from in container.env_from:
                     if env_from.config_map_ref:
@@ -378,7 +667,7 @@ async def check_pod_config_references(pod_name: str, namespace: str = "default")
                                 missing_secrets.append(secret_name)
         
         return {
-            "pod": pod_name,
+            "pod": actual_pod_name,
             "missing_configmaps": missing_configs,
             "missing_secrets": missing_secrets,
             "issue": "CRITICAL: Pod references non-existent ConfigMaps/Secrets!" if (missing_configs or missing_secrets) else "All config references are valid"
@@ -388,7 +677,7 @@ async def check_pod_config_references(pod_name: str, namespace: str = "default")
 
 
 # ==========================================
-# NODE & RESOURCE TOOLS
+# NODE & RESOURCE TOOLS (EXISTING - KEPT AS IS)
 # ==========================================
 
 @tool()
@@ -479,7 +768,7 @@ async def get_resource_quotas(namespace: str = "default"):
 
 
 # ==========================================
-# RBAC TOOLS
+# RBAC TOOLS (EXISTING - KEPT AS IS)
 # ==========================================
 
 @tool()
@@ -529,7 +818,7 @@ async def check_service_account_permissions(service_account: str, namespace: str
 
 
 # ==========================================
-# SUMMARY TOOLS
+# SUMMARY TOOLS (EXISTING - KEPT AS IS)
 # ==========================================
 
 @tool()

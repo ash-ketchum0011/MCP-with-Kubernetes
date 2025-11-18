@@ -2,26 +2,56 @@
 import json
 import asyncio
 import os
+import logging
 from typing import Dict, Any
 from mcp.server import LocalMCP, list_tools
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Configuration constants
+MAX_CONVERSATION_STEPS = int(os.getenv("MAX_CONVERSATION_STEPS", "6"))
+MAX_RESPONSE_LENGTH = 50000
+DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+
 # Enhanced system prompt with YAML generation capability
-SYSTEM_PROMPT = """You are a Kubernetes SRE assistant that helps diagnose cluster issues and generate Kubernetes manifests.
+SYSTEM_PROMPT = """You are a Kubernetes SRE assistant that helps diagnose cluster issues, retrieve YAML manifests, and edit deployments.
 
 CRITICAL: You MUST respond with ONLY valid JSON. No markdown, no explanations, ONLY JSON.
 
-Two response formats:
+Three response formats:
 
 1) To call a tool:
 {{"tool_call": {{"name": "TOOL_NAME", "args": {{}}}}}}
 
-2) To give final answer:
+2) To present data directly (pod names, lists, etc):
+{{"data_response": {{"summary": "...", "items": [...], "format": "list"}}}}
+
+3) To give final answer:
 {{"final_response": {{"analysis": "...", "recommendation": "...", "kubectl": "...", "yaml": "...", "confidence": 0.9, "post_checks": [...]}}}}
 
 Available tools: {tools}
+
+CRITICAL PARAMETER NAMES - Use these EXACT names when calling tools:
+- get_pod_logs: Use "pod_name" (accepts "pod" as alias)
+- get_pod_details: Use "pod_name" (accepts "pod" as alias)
+- get_pod_metrics: Use "pod_name" (accepts "pod" as alias)
+- check_pod_config_references: Use "pod_name" (accepts "pod" as alias)
+- test_dns_from_pod: Use "pod_name" (accepts "pod" as alias)
+- test_connectivity_from_pod: Use "source_pod" (accepts "pod" as alias)
+
+NEW YAML RETRIEVAL TOOLS:
+- get_deployment_yaml(deployment_name, namespace): Get ACTUAL deployment YAML from cluster
+- get_pod_yaml(pod_name, namespace): Get ACTUAL pod YAML from cluster
+- get_service_yaml(service_name, namespace): Get ACTUAL service YAML from cluster
+
+NEW EDITING TOOLS:
+- patch_deployment_command(deployment_name, container_name, new_command, namespace): Update container command
+- patch_deployment_replicas(deployment_name, replicas, namespace): Scale deployment
 
 ENHANCED TROUBLESHOOTING METHODOLOGY:
 
@@ -32,10 +62,10 @@ ENHANCED TROUBLESHOOTING METHODOLOGY:
 
 A) POD ISSUES (crash, restart, OOM):
    1. get_pods() → identify failing pods
-   2. get_pod_logs() → find error messages
-   3. get_pod_metrics() → check resource usage
+   2. get_pod_logs(pod_name="...", namespace="...") → find error messages
+   3. get_pod_metrics(pod_name="...", namespace="...") → check resource usage
    4. get_cluster_events() → check OOMKilled, ImagePull failures
-   5. check_pod_config_references() → verify configs exist
+   5. check_pod_config_references(pod_name="...", namespace="...") → verify configs exist
 
 B) NETWORKING ISSUES (connection refused, timeout, DNS):
    1. get_services() → verify service exists
@@ -50,7 +80,7 @@ C) STORAGE ISSUES (pending PVC, volume mount failures):
 D) CONFIGURATION ISSUES (ConfigMap/Secret not found):
    1. get_configmaps() → verify ConfigMap exists
    2. get_secrets() → verify Secret exists (shows keys only)
-   3. check_pod_config_references() → find which configs are missing
+   3. check_pod_config_references(pod_name="...", namespace="...") → find which configs are missing
 
 E) SCHEDULING/RESOURCE ISSUES (pod pending, nodes full):
    1. get_node_details() → check node capacity and conditions
@@ -60,38 +90,40 @@ F) PERMISSION ISSUES (Forbidden, Unauthorized):
    1. check_service_account_permissions() → verify RBAC setup
    2. get_cluster_events() → look for permission denied events
 
-**Common Patterns:**
-- Service 503/502 → get_endpoints → NO endpoints → check backing pods
-- Connection timeout → get_network_policies → policy blocking traffic
-- Pod pending → get_node_details → nodes at capacity OR get_persistent_volume_claims → PVC pending
-- ConfigMap error → check_pod_config_references → ConfigMap missing
-- Forbidden errors → check_service_account_permissions → no RBAC bindings
+**YAML RETRIEVAL vs GENERATION:**
+- User asks "return/show/get YAML for existing resource" → Use get_deployment_yaml() / get_pod_yaml() / get_service_yaml()
+- User asks "create/generate YAML for new resource" → Generate new YAML from scratch
 
-**YAML GENERATION CAPABILITY:**
-When user asks for YAML/manifest/configuration:
-- Generate complete, valid Kubernetes YAML
-- Include all required fields (apiVersion, kind, metadata, spec)
-- Use best practices (labels, resource limits, probes)
-- Add helpful comments
-- Return in the "yaml" field of final_response
-- Set kubectl command to "kubectl apply -f <filename>"
+**EDITING DEPLOYMENTS:**
+- User asks to "fix/update/change command" → Use get_deployment_yaml() first, then patch_deployment_command()
+- User asks to "scale/change replicas" → Use patch_deployment_replicas()
 
-YAML EXAMPLES:
-User: "create yaml for service account my-sa in namespace default"
-You: {{"final_response": {{
-  "analysis": "Generated ServiceAccount YAML for 'my-sa' in 'default' namespace with standard labels",
-  "recommendation": "Review and apply. Add RoleBindings as needed for permissions.",
-  "kubectl": "kubectl apply -f serviceaccount.yaml",
-  "yaml": "apiVersion: v1\\nkind: ServiceAccount\\nmetadata:\\n  name: my-sa\\n  namespace: default\\n  labels:\\n    app: my-sa",
-  "confidence": 1.0,
-  "post_checks": ["kubectl get sa my-sa -n default"]
-}}}}
+**DATA PRESENTATION:**
+When user asks to "list pod names" or "show me the pods" or "what are the pod names":
+1. Call get_pods()
+2. Extract just the names from the result
+3. Return using data_response format with items as a simple list
 
-**Tool Selection Rules:**
-- Always check service endpoints before assuming network issue
-- Always check PVC status if pod is pending with volume
-- Use get_cluster_health_summary for "what's wrong?" questions
-- For YAML generation, skip tools and generate directly
+Example:
+User: "list pod names from kube-system"
+Step 1: {{"tool_call": {{"name": "get_pods", "args": {{"namespace": "kube-system"}}}}}}
+Step 2: {{"data_response": {{"summary": "Found 12 pods in kube-system namespace", "items": ["coredns-1234", "kube-proxy-5678", ...], "format": "list"}}}}
+
+**FIXING CRASHING PODS:**
+When user asks to fix a crashing pod:
+1. get_pod_logs() → identify error
+2. get_deployment_yaml() → see current config
+3. Analyze the issue (e.g., bad command)
+4. patch_deployment_command() → fix it
+5. Return success message
+
+Example:
+User: "fix the crash-demo deployment, the command is wrong"
+Step 1: get_pod_logs(pod_name="crash-demo-xxx", namespace="default")
+Step 2: get_deployment_yaml(deployment_name="crash-demo", namespace="default")
+Step 3: Identify bad command: ["nonexistent-command"]
+Step 4: patch_deployment_command(deployment_name="crash-demo", container_name="crash-container", new_command=["sh", "-c", "sleep 3600"], namespace="default")
+Step 5: {{"final_response": {{"analysis": "Found issue: command 'nonexistent-command' does not exist", "recommendation": "Updated command to 'sleep 3600' - pods will restart automatically", "kubectl": "kubectl get pods -n default -w", "confidence": 0.95, "post_checks": ["Wait for new pods to become Ready", "Check logs: kubectl logs <new-pod>"]}}}}
 
 **kubectl Command Guidelines:**
 - Include namespace: -n <namespace>
@@ -102,7 +134,7 @@ You: {{"final_response": {{
 Remember: ONLY output JSON, nothing else."""
 
 mcp_client = LocalMCP()
-DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+
 
 class AIAgent:
     def __init__(self, adapter):
@@ -123,39 +155,119 @@ class AIAgent:
         finally:
             loop.close()
     
-    def process_input(self, user_question: str, max_steps: int = 6):
+    def _clean_json_response(self, reply: str) -> str:
+        """Clean up AI response to extract valid JSON"""
+        reply = reply.strip()
+        
+        # Remove markdown code blocks
+        if reply.startswith("```json"):
+            reply = reply[7:]
+        elif reply.startswith("```"):
+            reply = reply[3:]
+        
+        if reply.endswith("```"):
+            reply = reply[:-3]
+        
+        return reply.strip()
+    
+    def _handle_tool_error(self, tool_name: str, tool_args: Dict[str, Any], error: Exception, conversation_context: list) -> Dict[str, Any]:
+        """Handle tool invocation errors and provide recovery hints"""
+        error_msg = str(error)
+        
+        # Check if it's a parameter name issue
+        if "missing 1 required positional argument" in error_msg:
+            hint = ""
+            if "pod_name" in error_msg:
+                hint = f"Tool '{tool_name}' requires 'pod_name' parameter. You used: {list(tool_args.keys())}. Try using 'pod_name' instead of 'pod'."
+            
+            error_info = {
+                "tool": tool_name,
+                "args": tool_args,
+                "error": f"Parameter mismatch: {error_msg}",
+                "hint": hint,
+                "recovery": "Retry with correct parameter names"
+            }
+            conversation_context.append(error_info)
+            return error_info
+        
+        # Generic error
+        error_info = {
+            "tool": tool_name,
+            "args": tool_args,
+            "error": str(error)
+        }
+        conversation_context.append(error_info)
+        return error_info
+    
+    def _format_data_response(self, resp: Dict[str, Any]) -> str:
+        """Format data_response (for listing items)"""
+        output = []
+        
+        if resp.get("summary"):
+            output.append(f"## 📋 {resp['summary']}")
+            output.append("")
+        
+        items = resp.get("items", [])
+        if items:
+            if resp.get("format") == "list":
+                # Simple list format
+                for item in items:
+                    output.append(f"- {item}")
+            elif resp.get("format") == "table":
+                # Table format (if items are dicts)
+                for item in items:
+                    if isinstance(item, dict):
+                        for key, value in item.items():
+                            output.append(f"**{key}**: {value}")
+                        output.append("")
+            else:
+                # Default: just list items
+                for item in items:
+                    output.append(f"- {item}")
+        
+        return "\n".join(output)
+    
+    def process_input(self, user_question: str, max_steps: int = MAX_CONVERSATION_STEPS):
         """Main dialog loop with the AI agent"""
         conversation_context = []
         user_msg = json.dumps({"user_question": user_question})
         
         for step in range(max_steps):
             if DEBUG:
-                print(f"\n[DEBUG] Step {step + 1}/{max_steps}")
-                print(f"[DEBUG] Sending to AI: {user_msg[:200]}...")
+                logger.debug(f"\n[DEBUG] Step {step + 1}/{max_steps}")
+                logger.debug(f"[DEBUG] Sending to AI: {user_msg[:200]}...")
             
             # Get AI response
-            reply = self.adapter.chat(self._get_system_prompt(), user_msg)
+            try:
+                reply = self.adapter.chat(self._get_system_prompt(), user_msg)
+            except Exception as e:
+                logger.error(f"AI adapter error: {e}")
+                return f"❌ Error: Failed to get AI response: {e}"
             
             if DEBUG:
-                print(f"[DEBUG] AI raw response: {reply}")
+                logger.debug(f"[DEBUG] AI raw response: {reply}")
             
-            # Clean up response - remove markdown code blocks if present
-            reply = reply.strip()
-            if reply.startswith("```json"):
-                reply = reply[7:]
-            if reply.startswith("```"):
-                reply = reply[3:]
-            if reply.endswith("```"):
-                reply = reply[:-3]
-            reply = reply.strip()
+            # Clean up response
+            reply = self._clean_json_response(reply)
             
             if DEBUG:
-                print(f"[DEBUG] AI cleaned response: {reply}")
+                logger.debug(f"[DEBUG] AI cleaned response: {reply}")
             
+            # Parse JSON
             try:
                 parsed = json.loads(reply)
             except json.JSONDecodeError as e:
-                return f"❌ Error: AI returned invalid JSON:\n{reply}\n\nError: {e}"
+                logger.error(f"JSON decode error: {e}")
+                logger.error(f"Raw response: {reply}")
+                
+                # Try to provide helpful feedback
+                error_msg = f"❌ Error: AI returned invalid JSON. This usually means:\n"
+                error_msg += f"1. The AI model is struggling with the complex prompt\n"
+                error_msg += f"2. Token limit was exceeded\n"
+                error_msg += f"3. The response was truncated\n\n"
+                error_msg += f"Raw response (first 500 chars):\n{reply[:500]}\n\n"
+                error_msg += f"Error: {e}"
+                return error_msg
             
             # Check if this is a tool call
             if "tool_call" in parsed:
@@ -164,7 +276,7 @@ class AIAgent:
                 tool_args = tool_info.get("args", {})
                 
                 if DEBUG:
-                    print(f"[DEBUG] Tool call: {tool_name} with args {tool_args}")
+                    logger.debug(f"[DEBUG] Tool call: {tool_name} with args {tool_args}")
                 
                 if tool_name not in self.tools:
                     return f"❌ Error: AI requested unknown tool '{tool_name}'. Available: {list(self.tools.keys())}"
@@ -173,7 +285,7 @@ class AIAgent:
                 try:
                     result = self._invoke_tool_sync(tool_name, tool_args)
                     if DEBUG:
-                        print(f"[DEBUG] Tool result: {str(result)[:200]}...")
+                        logger.debug(f"[DEBUG] Tool result: {str(result)[:200]}...")
                     
                     conversation_context.append({
                         "tool": tool_name,
@@ -181,21 +293,31 @@ class AIAgent:
                         "result": result
                     })
                     
-                    # Update user message with tool result
-                    user_msg = json.dumps({
-                        "user_question": user_question,
-                        "conversation": conversation_context
-                    })
-                    
                 except Exception as e:
-                    return f"❌ Error invoking tool '{tool_name}': {e}"
+                    logger.error(f"Tool invocation error: {e}")
+                    error_info = self._handle_tool_error(tool_name, tool_args, e, conversation_context)
+                    
+                    # Don't return error immediately - let AI try to recover
+                    if DEBUG:
+                        logger.debug(f"[DEBUG] Tool error handled, allowing AI to retry")
+                
+                # Update user message with conversation history
+                user_msg = json.dumps({
+                    "user_question": user_question,
+                    "conversation": conversation_context
+                })
+            
+            # Check if this is a data response (for listing items)
+            elif "data_response" in parsed:
+                resp = parsed["data_response"]
+                return self._format_data_response(resp)
             
             # Check if this is a final response
             elif "final_response" in parsed:
                 resp = parsed["final_response"]
                 
                 if DEBUG:
-                    print(f"[DEBUG] Final response received")
+                    logger.debug(f"[DEBUG] Final response received")
                 
                 # Format the response nicely
                 output = []
@@ -226,6 +348,7 @@ class AIAgent:
                 return "\n".join(output)
             
             else:
+                logger.error(f"Unexpected response format: {parsed}")
                 return f"❌ Error: AI returned unexpected format:\n{json.dumps(parsed, indent=2)}"
         
-        return f"❌ Error: Reached maximum conversation steps ({max_steps}) without a final response. The AI may be stuck in a loop."
+        return f"❌ Error: Reached maximum conversation steps ({max_steps}) without a final response. The AI may be stuck in a loop or the problem is too complex for the current configuration."

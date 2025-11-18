@@ -1,10 +1,19 @@
 # ai/adapters.py
 import os
+import logging
 from openai import OpenAI
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY")
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "local")  # "openai", "openrouter", or "local"
+
+# Configuration
+HTTP_REFERER = os.getenv("HTTP_REFERER", "https://github.com/k8s-ai-assistant")
+APP_TITLE = os.getenv("APP_TITLE", "K8s AI Assistant")
 
 
 class OpenAIAdapter:
@@ -14,6 +23,7 @@ class OpenAIAdapter:
             raise RuntimeError("OPENAI_API_KEY not set")
         self.client = OpenAI(api_key=OPENAI_KEY)
         self.model = "gpt-4o-mini"
+        logger.info(f"🤖 Using OpenAI with model: {self.model}")
     
     def chat(self, system: str, user: str, max_tokens: int = 1024, temperature: float = 0.0):
         try:
@@ -38,6 +48,7 @@ class OpenAIAdapter:
             
             return content
         except Exception as e:
+            logger.error(f"OpenAI API error: {str(e)}")
             raise RuntimeError(f"OpenAI API error: {str(e)}") from e
 
 
@@ -53,7 +64,7 @@ class OpenRouterAdapter:
             base_url="https://openrouter.ai/api/v1"
         )
         self.model = model
-        print(f"🌐 Using OpenRouter with model: {model}")
+        logger.info(f"🌐 Using OpenRouter with model: {model}")
     
     def chat(self, system: str, user: str, max_tokens: int = 1024, temperature: float = 0.0):
         try:
@@ -68,8 +79,8 @@ class OpenRouterAdapter:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 extra_headers={
-                    "HTTP-Referer": "https://github.com/your-repo",  # Optional: for rankings
-                    "X-Title": "K8s AI Assistant"  # Optional: show in rankings
+                    "HTTP-Referer": HTTP_REFERER,  # Now using env var
+                    "X-Title": APP_TITLE  # Now using env var
                 }
             )
             
@@ -89,6 +100,7 @@ class OpenRouterAdapter:
             return content
             
         except Exception as e:
+            logger.error(f"OpenRouter API error: {str(e)}")
             # Re-raise the exception so the agent can handle it properly
             raise RuntimeError(f"OpenRouter API error: {str(e)}") from e
 
@@ -97,7 +109,7 @@ class LocalAdapter:
     """Local adapter for offline testing"""
     def __init__(self):
         self.call_count = 0
-        print("🔌 Using Local Adapter (no API calls)")
+        logger.info("🔌 Using Local Adapter (no API calls)")
     
     def chat(self, system: str, user: str, **kwargs):
         """Simple deterministic behavior for testing"""

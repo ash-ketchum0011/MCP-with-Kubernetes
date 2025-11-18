@@ -63,16 +63,21 @@ async def get_pods(namespace: str = "default", **kwargs):
 
 
 @tool()
-async def get_pod_logs(pod_name: str, namespace: str = "default", tail_lines: int = 200, **kwargs):
+async def get_pod_logs(pod_name: str = None, namespace: str = "default", tail_lines: int = 200, pod: str = None, **kwargs):
     """Get and sanitize recent logs for a pod.
     
     Args:
-        pod_name: Name of the pod to get logs from
+        pod_name: Name of the pod to get logs from (alias: pod)
         namespace: The namespace of the pod (default: "default")
         tail_lines: Number of lines to retrieve (default: 200)
     """
+    # Handle both parameter names for flexibility
+    actual_pod_name = pod_name or pod
+    if not actual_pod_name:
+        return {"error": "pod_name or pod parameter is required"}
+    
     try:
-        raw = v1.read_namespaced_pod_log(name=pod_name, namespace=namespace, tail_lines=tail_lines)
+        raw = v1.read_namespaced_pod_log(name=actual_pod_name, namespace=namespace, tail_lines=tail_lines)
     except Exception as e:
         return {"error": f"failed to fetch logs: {e}"}
     
@@ -83,24 +88,29 @@ async def get_pod_logs(pod_name: str, namespace: str = "default", tail_lines: in
     if len(sanitized) > 50_000:
         sanitized = sanitized[-50_000:]
     
-    return {"pod": pod_name, "namespace": namespace, "logs": sanitized}
+    return {"pod": actual_pod_name, "namespace": namespace, "logs": sanitized}
 
 
 @tool()
-async def get_pod_metrics(pod_name: str, namespace: str = "default", **kwargs):
+async def get_pod_metrics(pod_name: str = None, namespace: str = "default", pod: str = None, **kwargs):
     """Fetch current CPU/memory via metrics.k8s.io (metrics-server) if available.
     
     Args:
-        pod_name: Name of the pod to get metrics for
+        pod_name: Name of the pod to get metrics for (alias: pod)
         namespace: The namespace of the pod (default: "default")
     """
+    # Handle both parameter names for flexibility
+    actual_pod_name = pod_name or pod
+    if not actual_pod_name:
+        return {"error": "pod_name or pod parameter is required"}
+    
     try:
         resp = custom.get_namespaced_custom_object(
             group="metrics.k8s.io",
             version="v1beta1",
             namespace=namespace,
             plural="pods",
-            name=pod_name
+            name=actual_pod_name
         )
         mem_bytes = 0
         cpu_millis = 0
@@ -128,7 +138,7 @@ async def get_pod_metrics(pod_name: str, namespace: str = "default", **kwargs):
                 else:
                     cpu_millis += int(float(cpu) * 1000)
         
-        return {"pod": pod_name, "namespace": namespace, "memory_bytes": mem_bytes, "cpu_milli": cpu_millis}
+        return {"pod": actual_pod_name, "namespace": namespace, "memory_bytes": mem_bytes, "cpu_milli": cpu_millis}
     except Exception as e:
         return {"error": "metrics API not available (metrics-server missing?)", "details": str(e)}
 
@@ -211,13 +221,13 @@ async def get_pod_details(pod_name: str = None, namespace: str = "default", pod:
     """Get detailed information about a specific pod including status, conditions, and container states.
     
     Args:
-        pod_name: Name of the pod to get details for
+        pod_name: Name of the pod to get details for (alias: pod)
         namespace: The namespace of the pod (default: "default")
     """
     # Handle both 'pod_name' and 'pod' parameter names
     actual_pod_name = pod_name or pod
     if not actual_pod_name:
-        return {"error": "pod_name is required"}
+        return {"error": "pod_name or pod parameter is required"}
     
     try:
         pod_obj = v1.read_namespaced_pod(name=actual_pod_name, namespace=namespace)
